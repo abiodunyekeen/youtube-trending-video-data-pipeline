@@ -1,0 +1,90 @@
+{
+  "Comment": "YouTube Data Quality & Processing Workflow",
+  "StartAt": "RunDataQualityChecks",
+  "States": {
+    "RunDataQualityChecks": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:608040299654:function:abbey-youtube-data-pipeline-data-quality",
+      "Parameters": {
+        "layer": "silver",
+        "database": "abbey-youtube-data-pipeline-silver-db",
+        "tables": [
+          "clean_statistics",
+          "clean_reference_data"
+        ]
+      },
+      "ResultPath": "$.quality_result",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendFailureAlert",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "PassOrFailDecision"
+    },
+    "PassOrFailDecision": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.quality_result.quality_passed",
+          "BooleanEquals": true,
+          "Next": "RunGlueAggregation"
+        }
+      ],
+      "Default": "SendFailureAlert"
+    },
+    "RunGlueAggregation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "abbey-youtube-data-pipeline-silver-to-gold",
+        "Arguments": {
+          "--output_bucket": "abbey-youtube-data-pipeline-gold"
+        }
+      },
+      "ResultPath": "$.glue_result",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendFailureAlert",
+          "ResultPath": "$.error"
+        }
+      ],
+      "Next": "DataQualityPassed"
+    },
+    "DataQualityPassed": {
+      "Type": "Succeed"
+    },
+    "SendFailureAlert": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:608040299654:abbey-youtube-data-pipeline-alerts",
+        "Subject": "YouTube Pipeline - Data Quality Failed",
+        "Message.$": "States.JsonToString($.quality_result)"
+      },
+      "Next": "DataQualityFailed"
+    },
+    "DataQualityFailed": {
+      "Type": "Fail",
+      "Error": "DataQualityFailed",
+      "Cause": "One or more data quality checks failed"
+    }
+  }
+}
