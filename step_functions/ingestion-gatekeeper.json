@@ -1,0 +1,113 @@
+{
+  "Comment": "Orchestrates YouTube Data Ingestion Pipeline Ingestion Security, Schema Validation, and Routing Gates.",
+  "StartAt": "RunScannersInParallel",
+  "States": {
+    "RunScannersInParallel": {
+      "Type": "Parallel",
+      "Next": "EvaluateScanResults",
+      "ResultPath": "$.ScannerOutputs",
+      "Branches": [
+        {
+          "StartAt": "ScanForMalware",
+          "States": {
+            "ScanForMalware": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:608040299654:function:abbey-youtube-data-pipeline-malware-scanning",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ]
+            }
+          }
+        },
+        {
+          "StartAt": "ValidateMetadataSchema",
+          "States": {
+            "ValidateMetadataSchema": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:us-east-1:608040299654:function:abbey-youtube-data-pipeline-metadata_validator",
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendFailureNotification",
+          "ResultPath": "$.ExecutionError"
+        }
+      ]
+    },
+    "EvaluateScanResults": {
+      "Type": "Pass",
+      "Parameters": {
+        "bucket.$": "$$.Execution.Input.bucket",
+        "key.$": "$$.Execution.Input.key",
+        "scan_result.$": "$.ScannerOutputs[0].scan_result",
+        "is_valid.$": "$.ScannerOutputs[1].isValid"
+      },
+      "Next": "RouteFile",
+      "ResultPath": "$.RoutingPayload"
+    },
+    "RouteFile": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:us-east-1:608040299654:function:abbey-youtube-data-pipeline-router",
+      "InputPath": "$.RoutingPayload",
+      "ResultPath": "$.RoutingResult",
+      "Next": "CheckIfQuarantined",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SendFailureNotification",
+          "ResultPath": "$.ExecutionError"
+        }
+      ]
+    },
+    "CheckIfQuarantined": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.RoutingResult.status",
+          "StringEquals": "QUARANTINE",
+          "Next": "SendFailureNotification"
+        }
+      ],
+      "Default": "PipelineSuccess"
+    },
+    "SendFailureNotification": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:608040299654:abbey-youtube-data-pipeline-alerts",
+        "Subject": "ALERT: Ingestion Pipeline Failure or File Quarantined",
+        "Message.$": "States.JsonToString($)"
+      },
+      "Next": "PipelineSuccess"
+    },
+    "PipelineSuccess": {
+      "Type": "Succeed"
+    }
+  }
+}
