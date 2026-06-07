@@ -1,180 +1,249 @@
-# Architecture
+# Pipeline Flow
 
-This document explains the design decisions behind the YouTube Trending
-Video Data Pipeline, what each component does, and why it was chosen.
+This document walks through every stage of the pipeline in detail —
+what happens, which service handles it, and what the output is.
 
 ---
 
-## Medallion Architecture
+## Data Ingestion
 
-The pipeline follows the medallion architecture pattern with three data layers:
+### Source 1 — YouTube Data API (automated)
 
-| Layer | Bucket | Purpose |
+A scheduled EventBridge rule fires daily at 1am UTC and triggers
+the `abbey-youtube-data-pipeline-api-ingestion` Lambda function.
+
+The Lambda:
+1. Calls the YouTube Data API v3 to fetch trending video statistics
+2. Collects data for all configured regions (CA, GB, US, IN, DE, FR, etc.)
+3. Writes JSON files to the Landing Zone:
+
+```
+s3://abbey-youtube-data-pipeline-landing-zone/youtube/raw_statistics/region=ca/date=2026-06-02/data.json
+```
+
+### Source 2 — Kaggle CSV / Manual Upload
+
+Historical data from Kaggle or bulk transfers can be uploaded manually
+using any of three methods:
+
+**AWS Console:**
+```
+S3 → abbey-youtube-data-pipeline-landing-zone
+→ youtube/raw_statistics/region=xx/
+→ Upload files
+```
+
+**AWS CLI:**
+```bash
+aws s3 cp CAvideos.csv \
+  s3://abbey-youtube-data-pipeline-landing-zone/youtube/raw_statistics/region=ca/
+```
+
+**SFTP:**
+```
+Connect to the configured SFTP endpoint
+Upload files — they land automatically in the Landing Zone bucket
+```
+
+---
+
+## Landing Zone — Governance Gate
+
+Every file that lands in the Landing Zone immediately triggers:
+
+```
+S3 Object Created event
+    → EventBridge rule: abbey-youtube-landing-zone-ingestion-rule
+        → Step Functions Workflow 1
+```
+
+### Step Functions Workflow 1 — States
+
+**1. RunScannersInParallel (Parallel state)**
+
+Both scanners run simultaneously to save time:
+
+- **Malware Scanning Lambda** — scans the file content for known
+  malware signatures. Returns `scan_result: CLEAN` or `scan_result: INFECTED`
+
+- **Metadata Validation Lambda** — checks the file has the expected
+  structure, correct columns, and valid data types.
+  Returns `isValid: true` or `isValid: false`
+
+**2. EvaluateScanResults (Pass state)**
+
+Combines the outputs from both scanners into a single routing payload:
+```json
+{
+  "bucket": "abbey-youtube-data-pipeline-landing-zone",
+  "key": "youtube/raw_statistics/region=ca/CAvideos.csv",
+  "scan_result": "CLEAN",
+  "is_valid": true
+}
+```
+
+**3. RouteFile (Task state — Router Lambda)**
+
+The Router Lambda reads the scan results and decides where the file goes:
+
+| scan_result | is_valid | Destination |
 |---|---|---|
-| Bronze | `abbey-youtube-data-pipeline-bronze` | Raw data exactly as received — never modified |
-| Silver | `abbey-youtube-data-pipeline-silver` | Cleansed, typed, deduplicated Parquet data |
-| Gold | `abbey-youtube-data-pipeline-gold` | Business aggregations ready for analytics |
+| CLEAN | true | Bronze S3 |
+| INFECTED | any | Quarantine S3 + SNS alert |
+| CLEAN | false | Quarantine S3 + SNS alert |
 
-### Why medallion architecture?
+The Router copies the file to the destination bucket then deletes
+it from the Landing Zone. The Landing Zone never accumulates files.
 
-- Each layer is independently queryable and reprocessable
-- If a transformation is wrong, reprocess from Bronze without re-ingesting
-- Clear separation between raw, cleansed and aggregated data
-- Industry standard pattern used at Databricks, Netflix, Uber
+**4. CheckIfQuarantined (Choice state)**
 
----
-
-## Landing Zone
-
-The Landing Zone sits before Bronze and acts as a governance gate.
-
-```
-Data Source → Landing Zone → (scan + validate) → Bronze or Quarantine
-```
-
-### Why a Landing Zone?
-
-In production pipelines, data cannot be trusted at the point of entry.
-The Landing Zone ensures:
-
-- No malware enters the data lake
-- No corrupt or invalid files reach Bronze
-- Every file is auditable — you know what came in, what passed, what failed
-- Bronze always contains only clean, validated raw data
-
-### What happens in the Landing Zone?
-
-Every file that lands in the Landing Zone S3 bucket triggers an EventBridge
-rule which starts Step Functions Workflow 1:
-
-1. **Malware Scanning Lambda** — scans the file for malware signatures
-2. **Metadata Validation Lambda** — checks file format, structure and schema
-3. **Router Lambda** — based on results:
-   - `CLEAN` + `VALID` → copies file to Bronze S3, deletes from Landing Zone
-   - `INFECTED` or `INVALID` → copies file to Quarantine S3, sends SNS alert
+If the file was quarantined, sends an SNS failure notification.
+If the file reached Bronze, the workflow ends successfully.
 
 ---
 
-## Two Independent Workflows
+## Bronze Layer — Raw Data
 
-The pipeline is intentionally split into two separate workflows:
-
-### Workflow 1 — Ingestion
-
-- Triggered: per file, event-driven
-- Purpose: governance gate — scan, validate, route
-- Technology: EventBridge + Step Functions
-
-### Workflow 2 — Transformation
-
-- Triggered: daily schedule (2am UTC)
-- Purpose: transform raw data into analytics-ready tables
-- Technology: Glue Workflow + EventBridge + Step Functions
-
-### Why keep them separate?
+Bronze S3 holds raw data exactly as it arrived — no modifications.
+Files are organized using Hive-style partitioning:
 
 ```
-Ingestion is event-driven (fires immediately per file)
-Transformation is batch (runs once after all files have landed)
+s3://abbey-youtube-data-pipeline-bronze/
+└── youtube/
+    ├── raw_statistics/
+    │   └── region=ca/
+    │       └── date=2026-06-02/
+    │           └── data.json
+    └── raw_statistics_reference_data/
+        └── region=ca/
+            └── date=2026-06-02/
+                └── categories.json
 ```
-
-Combining them would mean the transformation starts after the first
-file lands, before all files have arrived. Separating them means
-transformation only runs after the full daily batch is in Bronze.
 
 ---
 
-## Component Design Decisions
+## Glue Workflow — Transformation Trigger
 
-### Why Step Functions over Lambda chaining?
+The Glue Workflow runs automatically every day at 2am UTC (one hour
+after the API ingestion at 1am, giving files time to land and process).
 
-Lambda chaining (Lambda A calls Lambda B calls Lambda C) has no visibility,
-no retry logic and no branching. Step Functions provides:
+**Stage 1 — Glue Crawler**
 
-- Visual graph showing exactly where a failure occurred
-- Built-in retry with exponential backoff
-- Pass/Fail branching with Choice states
-- Full execution history with input/output at every state
-
-### Why Glue Workflow for transformation chaining?
-
-The transformation chain (crawler → Bronze→Silver → Silver→Gold) is a
-linear sequence where each step depends on the previous. Glue Workflow
-handles this natively with event triggers between nodes:
+The crawler scans Bronze S3 and registers or updates tables in the
+Glue Data Catalog (`abbey-youtube-data-pipeline-bronze-db`):
 
 ```
-Crawler SUCCEEDED → Bronze→Silver job starts
-Bronze→Silver SUCCEEDED → Silver→Gold... (not in Glue Workflow)
+Tables created/updated:
+- raw_statistics        (JSON, partitioned by region + date)
+- clean_reference_data  (JSON, partitioned by region + date)
 ```
 
-Silver→Gold is intentionally excluded from the Glue Workflow because it
-must only run after data quality checks pass. It is triggered by
-Step Functions Workflow 2 instead.
+**Stage 2 — Bronze → Silver Glue Job**
 
-### Why EventBridge between Silver S3 and Step Functions?
+Triggered automatically when the crawler succeeds. The job:
 
-Glue Workflow cannot directly trigger Step Functions. EventBridge acts
-as the bridge — it watches for new objects in Silver S3 and starts the
-data quality Step Functions execution automatically.
-
-### Why Athena + QuickSight for analytics?
-
-- Athena queries Parquet files directly from S3 — no data warehouse needed
-- QuickSight connects to Athena for dashboards with no ETL between them
-- Both are serverless — no infrastructure to manage
-- Cost scales with usage — pay per query, not per hour
+1. Reads from the Bronze catalog table
+2. Detects file format (Kaggle CSV or YouTube API JSON) automatically
+3. Enforces schema — casts all columns to correct types
+4. Cleanses data — removes null video IDs, standardises region codes
+5. Parses trending dates from `YY.DD.MM` format to proper dates
+6. Fills null numeric columns with 0
+7. Adds derived columns: `like_ratio`, `engagement_rate`
+8. Deduplicates — keeps the latest record per video + region + date
+9. Adds metadata: `_processed_at`, `_job_name`
+10. Writes Parquet to Silver S3 partitioned by region
+11. Registers `clean_statistics` table in Silver catalog
 
 ---
 
-## Data Quality Checks
+## Silver Layer — Cleansed Data
 
-The Data Quality Lambda runs 13 checks against Silver layer tables before
-allowing aggregation to proceed:
+Silver S3 holds clean, typed, deduplicated Parquet data:
 
-| Check | Description |
-|---|---|
-| Row count | Minimum 10 rows must exist |
-| Null percentage | Critical columns must have less than 5% nulls |
-| Schema validation | All expected columns must be present |
-| Value ranges | No negative views, no extreme values above 50 billion |
-| Freshness | Data must be no older than 48 hours |
+```
+s3://abbey-youtube-data-pipeline-silver/
+└── youtube/
+    ├── statistics/
+    │   └── region=ca/
+    │       └── part-00000.snappy.parquet
+    └── reference_data/
+        └── region=ca/
+            └── part-00000.snappy.parquet
+```
 
-If any check fails, the pipeline stops and sends an SNS alert. The
-Silver→Gold aggregation job only runs after all checks pass.
+When new files are written to Silver S3, an EventBridge rule fires:
+
+```
+S3 Object Created (silver bucket, youtube/statistics/ prefix)
+    → EventBridge rule: abbey-silver-s3-to-dq-rule
+        → Step Functions Workflow 2
+```
 
 ---
 
-## Storage Design
+## Step Functions Workflow 2 — Data Quality
 
-### S3 Bucket Structure
+**Stage 1 — RunDataQualityChecks (Lambda)**
+
+The Data Quality Lambda runs 13 checks against both Silver tables
+using Amazon Athena (via `awswrangler`):
 
 ```
-Landing Zone:
-youtube/raw_statistics/region=ca/CAvideos.csv
-youtube/raw_statistics/region=gb/GBvideos.csv
+clean_statistics checks (9):
+  ✓ Row count ≥ 10
+  ✓ video_id null% < 5%
+  ✓ title null% < 5%
+  ✓ channel_title null% < 5%
+  ✓ views null% < 5%
+  ✓ region null% < 5%
+  ✓ Schema — all expected columns present
+  ✓ Value ranges — no negative views, no extreme values
+  ✓ Freshness — data no older than 48 hours
 
-Bronze:
-youtube/raw_statistics/region=ca/date=2026-06-02/data.json
-youtube/raw_statistics_reference_data/region=ca/date=2026-06-02/data.json
-
-Silver:
-youtube/statistics/region=ca/part-00000.snappy.parquet
-youtube/reference_data/region=ca/part-00000.snappy.parquet
-
-Gold:
-youtube/trending_analytics/region=ca/part-00000.snappy.parquet
-youtube/channel_analytics/region=ca/part-00000.snappy.parquet
-youtube/category_analytics/region=ca/part-00000.snappy.parquet
+clean_reference_data checks (4):
+  ✓ Row count ≥ 10
+  ✓ region null% < 5%
+  ✓ Schema — all expected columns present
+  ✓ Freshness check (skipped if no timestamp column)
 ```
 
-### Why Parquet with Snappy compression?
+**Stage 2 — PassOrFailDecision (Choice state)**
 
-- Parquet is columnar — Athena only reads the columns needed, reducing cost
-- Snappy compression reduces storage size by roughly 70% vs raw JSON/CSV
-- Both are industry standard for data lake analytics workloads
+If `quality_passed = true` → proceeds to aggregation
+If `quality_passed = false` → sends SNS alert and fails
 
-### Why partition by region?
+**Stage 3 — RunGlueAggregation (Glue job)**
 
-Partitioning by region means Athena queries like
-`WHERE region = 'gb'` only scan the `region=gb/` partition — not the
-entire table. This reduces query cost and time significantly.
+The Silver→Gold job runs only after all quality checks pass:
+
+1. Reads `clean_statistics` and `clean_reference_data` from Silver catalog
+2. Joins with category lookup for category names
+3. Produces three Gold tables:
+   - `trending_analytics` — daily summaries per region
+   - `channel_analytics` — channel performance with regional rankings
+   - `category_analytics` — category trends with view share percentages
+4. Writes Parquet to Gold S3 partitioned by region
+5. Registers tables in Gold catalog (`abbey-youtube-data-pipeline-gold-db`)
+
+---
+
+## Gold Layer — Analytics Ready
+
+Gold S3 holds business-level aggregations optimised for Athena and QuickSight:
+
+```
+s3://abbey-youtube-data-pipeline-gold/
+└── youtube/
+    ├── trending_analytics/region=ca/part-00000.snappy.parquet
+    ├── channel_analytics/region=ca/part-00000.snappy.parquet
+    └── category_analytics/region=ca/part-00000.snappy.parquet
+```
+
+Query example in Athena:
+```sql
+SELECT region, trending_date_parsed, total_views, avg_engagement_rate
+FROM trending_analytics
+WHERE region = 'gb'
+ORDER BY trending_date_parsed DESC
+LIMIT 100;
+```

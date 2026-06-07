@@ -1,180 +1,301 @@
-# Architecture
+# Troubleshooting
 
-This document explains the design decisions behind the YouTube Trending
-Video Data Pipeline, what each component does, and why it was chosen.
-
----
-
-## Medallion Architecture
-
-The pipeline follows the medallion architecture pattern with three data layers:
-
-| Layer | Bucket | Purpose |
-|---|---|---|
-| Bronze | `abbey-youtube-data-pipeline-bronze` | Raw data exactly as received — never modified |
-| Silver | `abbey-youtube-data-pipeline-silver` | Cleansed, typed, deduplicated Parquet data |
-| Gold | `abbey-youtube-data-pipeline-gold` | Business aggregations ready for analytics |
-
-### Why medallion architecture?
-
-- Each layer is independently queryable and reprocessable
-- If a transformation is wrong, reprocess from Bronze without re-ingesting
-- Clear separation between raw, cleansed and aggregated data
-- Industry standard pattern used at Databricks, Netflix, Uber
+This document covers every real error encountered building this pipeline
+and exactly how each was fixed.
 
 ---
 
-## Landing Zone
+## Glue Crawler Issues
 
-The Landing Zone sits before Bronze and acts as a governance gate.
+### Problem — Crawler generates scattered hash-suffixed tables
 
+**Symptom:**
 ```
-Data Source → Landing Zone → (scan + validate) → Bronze or Quarantine
+date_2026_05_31
+date_2026_05_31_3ca3282841981b17986ad5af3dca2041
+date_2026_05_31_4d14af01923f2a314d5f860c40579e10
 ```
 
-### Why a Landing Zone?
+**Cause:**
+Mixed file formats (CSV and JSON) coexist in the same region folder,
+or a new `date=` partition was added to a folder that previously only
+contained flat CSV files. The crawler treats them as incompatible
+schemas and creates separate tables with hash suffixes.
 
-In production pipelines, data cannot be trusted at the point of entry.
-The Landing Zone ensures:
+**Fix:**
+```
+Glue → Crawlers → your crawler → Edit → Advanced options
+✅ Create a single schema for each S3 path
+Table level: 3
+Schema changes: Update the table definition in the data catalog
+```
 
-- No malware enters the data lake
-- No corrupt or invalid files reach Bronze
-- Every file is auditable — you know what came in, what passed, what failed
-- Bronze always contains only clean, validated raw data
-
-### What happens in the Landing Zone?
-
-Every file that lands in the Landing Zone S3 bucket triggers an EventBridge
-rule which starts Step Functions Workflow 1:
-
-1. **Malware Scanning Lambda** — scans the file for malware signatures
-2. **Metadata Validation Lambda** — checks file format, structure and schema
-3. **Router Lambda** — based on results:
-   - `CLEAN` + `VALID` → copies file to Bronze S3, deletes from Landing Zone
-   - `INFECTED` or `INVALID` → copies file to Quarantine S3, sends SNS alert
+Then delete all scattered tables and re-run the crawler.
 
 ---
 
-## Two Independent Workflows
+### Problem — Glue job fails with Entity Not Found
 
-The pipeline is intentionally split into two separate workflows:
-
-### Workflow 1 — Ingestion
-
-- Triggered: per file, event-driven
-- Purpose: governance gate — scan, validate, route
-- Technology: EventBridge + Step Functions
-
-### Workflow 2 — Transformation
-
-- Triggered: daily schedule (2am UTC)
-- Purpose: transform raw data into analytics-ready tables
-- Technology: Glue Workflow + EventBridge + Step Functions
-
-### Why keep them separate?
-
+**Error:**
 ```
-Ingestion is event-driven (fires immediately per file)
-Transformation is batch (runs once after all files have landed)
+Entity Not Found (Service: Glue, Status Code: 400)
+An error occurred while calling getCatalogSource
 ```
 
-Combining them would mean the transformation starts after the first
-file lands, before all files have arrived. Separating them means
-transformation only runs after the full daily batch is in Bronze.
+**Cause:**
+The Glue catalog table that the job is trying to read does not exist.
+Either the crawler has not run yet, or the table name in the job
+parameters does not match the actual catalog table name.
+
+**Fix:**
+1. Run the Glue crawler first
+2. Check `Glue → Databases → your database → Tables` for the exact table name
+3. Update the `--bronze_table` or `--silver_table` job parameter to match exactly
 
 ---
 
-## Component Design Decisions
+## Lambda Issues
 
-### Why Step Functions over Lambda chaining?
+### Problem — Data Quality Lambda returns 404 bucket error
 
-Lambda chaining (Lambda A calls Lambda B calls Lambda C) has no visibility,
-no retry logic and no branching. Step Functions provides:
-
-- Visual graph showing exactly where a failure occurred
-- Built-in retry with exponential backoff
-- Pass/Fail branching with Choice states
-- Full execution history with input/output at every state
-
-### Why Glue Workflow for transformation chaining?
-
-The transformation chain (crawler → Bronze→Silver → Silver→Gold) is a
-linear sequence where each step depends on the previous. Glue Workflow
-handles this natively with event triggers between nodes:
-
+**Error:**
 ```
-Crawler SUCCEEDED → Bronze→Silver job starts
-Bronze→Silver SUCCEEDED → Silver→Gold... (not in Glue Workflow)
+Waiter BucketExists failed: Max attempts exceeded.
+Previously accepted state: Matched expected HTTP status code: 404
 ```
 
-Silver→Gold is intentionally excluded from the Glue Workflow because it
-must only run after data quality checks pass. It is triggered by
-Step Functions Workflow 2 instead.
+**Cause:**
+`awswrangler` is trying to write Athena query results to a bucket that
+either does not exist or the Lambda IAM role cannot access.
 
-### Why EventBridge between Silver S3 and Step Functions?
-
-Glue Workflow cannot directly trigger Step Functions. EventBridge acts
-as the bridge — it watches for new objects in Silver S3 and starts the
-data quality Step Functions execution automatically.
-
-### Why Athena + QuickSight for analytics?
-
-- Athena queries Parquet files directly from S3 — no data warehouse needed
-- QuickSight connects to Athena for dashboards with no ETL between them
-- Both are serverless — no infrastructure to manage
-- Cost scales with usage — pay per query, not per hour
+**Fix:**
+Add `s3_output` explicitly to the Athena query call:
+```python
+df = wr.athena.read_sql_query(
+    sql=query,
+    database=database,
+    ctas_approach=False,
+    s3_output="s3://abbey-youtube-data-pipeline-athena-results/query-results/"
+)
+```
 
 ---
 
-## Data Quality Checks
+### Problem — Data Quality Lambda returns InvalidRequestException
 
-The Data Quality Lambda runs 13 checks against Silver layer tables before
-allowing aggregation to proceed:
+**Error:**
+```
+Unable to verify/create output bucket abbey-youtube-data-pipeline-athena-results
+```
 
-| Check | Description |
-|---|---|
-| Row count | Minimum 10 rows must exist |
-| Null percentage | Critical columns must have less than 5% nulls |
-| Schema validation | All expected columns must be present |
-| Value ranges | No negative views, no extreme values above 50 billion |
-| Freshness | Data must be no older than 48 hours |
+**Cause:**
+The Lambda IAM role does not have S3 permissions on the Athena results bucket.
 
-If any check fails, the pipeline stops and sends an SNS alert. The
-Silver→Gold aggregation job only runs after all checks pass.
+**Fix:**
+Add these permissions to the Lambda IAM role:
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "s3:GetBucketLocation",
+    "s3:GetObject",
+    "s3:PutObject",
+    "s3:ListBucket"
+  ],
+  "Resource": [
+    "arn:aws:s3:::abbey-youtube-data-pipeline-athena-results",
+    "arn:aws:s3:::abbey-youtube-data-pipeline-athena-results/*"
+  ]
+}
+```
 
 ---
 
-## Storage Design
+### Problem — Data quality checks return "True" string instead of true boolean
 
-### S3 Bucket Structure
-
-```
-Landing Zone:
-youtube/raw_statistics/region=ca/CAvideos.csv
-youtube/raw_statistics/region=gb/GBvideos.csv
-
-Bronze:
-youtube/raw_statistics/region=ca/date=2026-06-02/data.json
-youtube/raw_statistics_reference_data/region=ca/date=2026-06-02/data.json
-
-Silver:
-youtube/statistics/region=ca/part-00000.snappy.parquet
-youtube/reference_data/region=ca/part-00000.snappy.parquet
-
-Gold:
-youtube/trending_analytics/region=ca/part-00000.snappy.parquet
-youtube/channel_analytics/region=ca/part-00000.snappy.parquet
-youtube/category_analytics/region=ca/part-00000.snappy.parquet
+**Symptom:**
+```json
+"passed": "True"   ← string, not boolean
 ```
 
-### Why Parquet with Snappy compression?
+**Cause:**
+Pandas operations return `numpy.bool_` not Python `bool`. When
+`json.dumps()` serialises numpy booleans it produces the string
+`"True"` instead of JSON `true`.
 
-- Parquet is columnar — Athena only reads the columns needed, reducing cost
-- Snappy compression reduces storage size by roughly 70% vs raw JSON/CSV
-- Both are industry standard for data lake analytics workloads
+**Fix:**
+Wrap all pandas comparison results in `bool()`:
+```python
+passed = bool(null_pct <= MAX_NULL_PCT)
+passed = bool(negative == 0 and extreme == 0)
+```
 
-### Why partition by region?
+---
 
-Partitioning by region means Athena queries like
-`WHERE region = 'gb'` only scan the `region=gb/` partition — not the
-entire table. This reduces query cost and time significantly.
+### Problem — Freshness check returns NaT and fails
+
+**Symptom:**
+```json
+{
+  "check": "freshness",
+  "latest_record": "NaT",
+  "passed": false
+}
+```
+
+**Cause:**
+The table has no timestamp column, or all timestamp values are null.
+`pd.to_datetime().max()` returns `NaT` (Not a Time) which fails
+comparison with the cutoff datetime.
+
+**Fix:**
+Add a NaT check before the comparison in `check_freshness`:
+```python
+latest = pd.to_datetime(df[ts_col]).max()
+if pd.isna(latest):
+    return {
+        "check": "freshness",
+        "table": table_name,
+        "passed": True,
+        "message": "No valid timestamps found — skipping freshness check"
+    }
+```
+
+---
+
+## Glue Job Issues
+
+### Problem — LAUNCH ERROR, script not found in S3
+
+**Error:**
+```
+LAUNCH ERROR | Error downloading from S3 for bucket:
+aws-glue-assets-608040299654-us-east-1,
+key: scripts/abbey-youtube-data-pipeline-bronze-to-silver.py
+```
+
+**Cause:**
+The Glue script file is missing from S3. This commonly happens when
+the `aws-glue-assets` bucket is accidentally emptied.
+
+**Fix:**
+```bash
+aws s3 cp glue_jobs/bronze_to_silver.py \
+  s3://aws-glue-assets-{account-id}-us-east-1/scripts/abbey-youtube-data-pipeline-bronze-to-silver.py
+```
+
+**Important:** Never empty the `aws-glue-assets` bucket. It contains
+all Glue job scripts, Spark history logs and temporary files.
+
+---
+
+### Problem — Silver→Gold job fails with Entity Not Found
+
+**Error:**
+```
+Entity Not Found on clean_statistics table
+```
+
+**Cause:**
+The Bronze→Silver job has not run yet, so `clean_statistics` does not
+exist in the Silver catalog. The Silver→Gold job depends on this table.
+
+**Fix:**
+Run the pipeline in the correct order:
+1. Run Glue crawler first
+2. Run Bronze→Silver job
+3. Only then run Silver→Gold job
+
+---
+
+## EventBridge Issues
+
+### Problem — Step Functions not triggered after Glue job succeeds
+
+**Cause (most common):** The job name in the EventBridge event pattern
+does not exactly match the actual Glue job name.
+
+**Fix:**
+```
+Glue → Jobs → copy the exact job name
+EventBridge → Rules → your rule → Edit → Event pattern
+→ verify jobName matches exactly character for character
+```
+
+**Test the rule manually:**
+```
+EventBridge → Rules → your rule → Send test event
+```
+```json
+{
+  "source": "aws.glue",
+  "detail-type": "Glue Job Run Status",
+  "detail": {
+    "jobName": "abbey-youtube-data-pipeline-silver-to-gold",
+    "state": "SUCCEEDED",
+    "jobRunId": "jr_test123"
+  }
+}
+```
+
+---
+
+### Problem — Landing Zone EventBridge rule not triggering
+
+**Cause:** EventBridge notifications are not enabled on the S3 bucket.
+
+**Fix:**
+```
+S3 → abbey-youtube-data-pipeline-landing-zone
+→ Properties → Amazon EventBridge → Edit → ON → Save
+```
+
+---
+
+## IAM Issues
+
+### Problem — Glue job cannot access S3
+
+**Fix:**
+Attach `AmazonS3FullAccess` to the Glue job IAM role, or add a
+scoped inline policy for the specific buckets the job needs to access.
+
+---
+
+### Problem — Lambda cannot start Glue crawler or workflow
+
+**Fix:**
+Add to the Lambda IAM role:
+```json
+{
+  "Effect": "Allow",
+  "Action": [
+    "glue:StartCrawler",
+    "glue:GetCrawler",
+    "glue:StartWorkflowRun",
+    "glue:GetWorkflow"
+  ],
+  "Resource": "*"
+}
+```
+
+---
+
+## General Debugging Steps
+
+When something fails, check in this order:
+
+```
+1. Step Functions → Executions → click the failed execution
+   → expand the failed state → read the error and cause
+
+2. CloudWatch → Log groups → /aws/lambda/function-name
+   → find the log stream matching the failure timestamp
+   → read the ERROR lines
+
+3. Glue → Jobs → Run history → click the failed run
+   → Logs → Driver logs → scroll to ERROR lines
+
+4. EventBridge → Rules → your rule → Monitoring tab
+   → check TriggeredRules and FailedInvocations metrics
+```

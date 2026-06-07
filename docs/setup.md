@@ -1,180 +1,260 @@
-# Architecture
+# Setup Guide
 
-This document explains the design decisions behind the YouTube Trending
-Video Data Pipeline, what each component does, and why it was chosen.
-
----
-
-## Medallion Architecture
-
-The pipeline follows the medallion architecture pattern with three data layers:
-
-| Layer | Bucket | Purpose |
-|---|---|---|
-| Bronze | `abbey-youtube-data-pipeline-bronze` | Raw data exactly as received — never modified |
-| Silver | `abbey-youtube-data-pipeline-silver` | Cleansed, typed, deduplicated Parquet data |
-| Gold | `abbey-youtube-data-pipeline-gold` | Business aggregations ready for analytics |
-
-### Why medallion architecture?
-
-- Each layer is independently queryable and reprocessable
-- If a transformation is wrong, reprocess from Bronze without re-ingesting
-- Clear separation between raw, cleansed and aggregated data
-- Industry standard pattern used at Databricks, Netflix, Uber
+This guide walks through deploying the YouTube Trending Video Data Pipeline
+from scratch in an AWS account.
 
 ---
 
-## Landing Zone
+## Prerequisites
 
-The Landing Zone sits before Bronze and acts as a governance gate.
-
-```
-Data Source → Landing Zone → (scan + validate) → Bronze or Quarantine
-```
-
-### Why a Landing Zone?
-
-In production pipelines, data cannot be trusted at the point of entry.
-The Landing Zone ensures:
-
-- No malware enters the data lake
-- No corrupt or invalid files reach Bronze
-- Every file is auditable — you know what came in, what passed, what failed
-- Bronze always contains only clean, validated raw data
-
-### What happens in the Landing Zone?
-
-Every file that lands in the Landing Zone S3 bucket triggers an EventBridge
-rule which starts Step Functions Workflow 1:
-
-1. **Malware Scanning Lambda** — scans the file for malware signatures
-2. **Metadata Validation Lambda** — checks file format, structure and schema
-3. **Router Lambda** — based on results:
-   - `CLEAN` + `VALID` → copies file to Bronze S3, deletes from Landing Zone
-   - `INFECTED` or `INVALID` → copies file to Quarantine S3, sends SNS alert
+- AWS Account
+- IAM user with administrator access (or scoped permissions)
+- AWS CLI installed and configured
+- Python 3.14
+- YouTube Data API v3 key (for live ingestion)
 
 ---
 
-## Two Independent Workflows
+## Step 1 — Create S3 Buckets
 
-The pipeline is intentionally split into two separate workflows:
-
-### Workflow 1 — Ingestion
-
-- Triggered: per file, event-driven
-- Purpose: governance gate — scan, validate, route
-- Technology: EventBridge + Step Functions
-
-### Workflow 2 — Transformation
-
-- Triggered: daily schedule (2am UTC)
-- Purpose: transform raw data into analytics-ready tables
-- Technology: Glue Workflow + EventBridge + Step Functions
-
-### Why keep them separate?
-
-```
-Ingestion is event-driven (fires immediately per file)
-Transformation is batch (runs once after all files have landed)
+```bash
+aws s3 mb s3://abbey-youtube-data-pipeline-landing-zone --region us-east-1
+aws s3 mb s3://abbey-youtube-data-pipeline-bronze --region us-east-1
+aws s3 mb s3://abbey-youtube-data-pipeline-silver --region us-east-1
+aws s3 mb s3://abbey-youtube-data-pipeline-gold --region us-east-1
+aws s3 mb s3://abbey-youtube-data-pipeline-quarantine --region us-east-1
+aws s3 mb s3://abbey-youtube-data-pipeline-athena-results --region us-east-1
 ```
 
-Combining them would mean the transformation starts after the first
-file lands, before all files have arrived. Separating them means
-transformation only runs after the full daily batch is in Bronze.
+Enable EventBridge notifications on the Landing Zone bucket:
+```
+S3 → abbey-youtube-data-pipeline-landing-zone
+→ Properties → Amazon EventBridge → Edit → ON → Save
+```
+
+Enable EventBridge notifications on the Silver bucket:
+```
+S3 → abbey-youtube-data-pipeline-silver
+→ Properties → Amazon EventBridge → Edit → ON → Save
+```
 
 ---
 
-## Component Design Decisions
-
-### Why Step Functions over Lambda chaining?
-
-Lambda chaining (Lambda A calls Lambda B calls Lambda C) has no visibility,
-no retry logic and no branching. Step Functions provides:
-
-- Visual graph showing exactly where a failure occurred
-- Built-in retry with exponential backoff
-- Pass/Fail branching with Choice states
-- Full execution history with input/output at every state
-
-### Why Glue Workflow for transformation chaining?
-
-The transformation chain (crawler → Bronze→Silver → Silver→Gold) is a
-linear sequence where each step depends on the previous. Glue Workflow
-handles this natively with event triggers between nodes:
+## Step 2 — Create SNS Topic
 
 ```
-Crawler SUCCEEDED → Bronze→Silver job starts
-Bronze→Silver SUCCEEDED → Silver→Gold... (not in Glue Workflow)
+SNS → Topics → Create topic
+Type: Standard
+Name: abbey-youtube-data-pipeline-alerts
 ```
 
-Silver→Gold is intentionally excluded from the Glue Workflow because it
-must only run after data quality checks pass. It is triggered by
-Step Functions Workflow 2 instead.
-
-### Why EventBridge between Silver S3 and Step Functions?
-
-Glue Workflow cannot directly trigger Step Functions. EventBridge acts
-as the bridge — it watches for new objects in Silver S3 and starts the
-data quality Step Functions execution automatically.
-
-### Why Athena + QuickSight for analytics?
-
-- Athena queries Parquet files directly from S3 — no data warehouse needed
-- QuickSight connects to Athena for dashboards with no ETL between them
-- Both are serverless — no infrastructure to manage
-- Cost scales with usage — pay per query, not per hour
+Add your email as a subscriber and confirm the subscription email.
 
 ---
 
-## Data Quality Checks
+## Step 3 — Create Glue Databases
 
-The Data Quality Lambda runs 13 checks against Silver layer tables before
-allowing aggregation to proceed:
+```
+Glue → Databases → Add database
+Name: abbey-youtube-data-pipeline-bronze-db
 
-| Check | Description |
-|---|---|
-| Row count | Minimum 10 rows must exist |
-| Null percentage | Critical columns must have less than 5% nulls |
-| Schema validation | All expected columns must be present |
-| Value ranges | No negative views, no extreme values above 50 billion |
-| Freshness | Data must be no older than 48 hours |
+Glue → Databases → Add database
+Name: abbey-youtube-data-pipeline-silver-db
 
-If any check fails, the pipeline stops and sends an SNS alert. The
-Silver→Gold aggregation job only runs after all checks pass.
+Glue → Databases → Add database
+Name: abbey-youtube-data-pipeline-gold-db
+```
 
 ---
 
-## Storage Design
-
-### S3 Bucket Structure
+## Step 4 — Create Glue Crawler
 
 ```
-Landing Zone:
-youtube/raw_statistics/region=ca/CAvideos.csv
-youtube/raw_statistics/region=gb/GBvideos.csv
-
-Bronze:
-youtube/raw_statistics/region=ca/date=2026-06-02/data.json
-youtube/raw_statistics_reference_data/region=ca/date=2026-06-02/data.json
-
-Silver:
-youtube/statistics/region=ca/part-00000.snappy.parquet
-youtube/reference_data/region=ca/part-00000.snappy.parquet
-
-Gold:
-youtube/trending_analytics/region=ca/part-00000.snappy.parquet
-youtube/channel_analytics/region=ca/part-00000.snappy.parquet
-youtube/category_analytics/region=ca/part-00000.snappy.parquet
+Glue → Crawlers → Create crawler
+Name: abbey-youtube-data-pipeline-bronze-crawler
+Data source: s3://abbey-youtube-data-pipeline-bronze/youtube/
+Database: abbey-youtube-data-pipeline-bronze-db
 ```
 
-### Why Parquet with Snappy compression?
+Advanced options:
+```
+✅ Create a single schema for each S3 path
+Table level: 3
+Schema changes: Update the table definition in the data catalog
+Deleted objects: Delete tables and partitions from the data catalog
+```
 
-- Parquet is columnar — Athena only reads the columns needed, reducing cost
-- Snappy compression reduces storage size by roughly 70% vs raw JSON/CSV
-- Both are industry standard for data lake analytics workloads
+---
 
-### Why partition by region?
+## Step 5 — Upload Glue Scripts
 
-Partitioning by region means Athena queries like
-`WHERE region = 'gb'` only scan the `region=gb/` partition — not the
-entire table. This reduces query cost and time significantly.
+```bash
+aws s3 cp glue_jobs/bronze_to_silver.py \
+  s3://aws-glue-assets-{account-id}-us-east-1/scripts/abbey-youtube-data-pipeline-bronze-to-silver.py
+
+aws s3 cp glue_jobs/silver_to_gold.py \
+  s3://aws-glue-assets-{account-id}-us-east-1/scripts/abbey-youtube-data-pipeline-silver-to-gold.py
+```
+
+Replace `{account-id}` with your AWS account ID.
+
+---
+
+## Step 6 — Create Glue Jobs
+
+**Bronze → Silver job:**
+```
+Glue → Jobs → Create job
+Name: abbey-youtube-data-pipeline-bronze-to-silver
+Type: Spark
+Glue version: Glue 5.1
+Script path: s3://aws-glue-assets-{account-id}-us-east-1/scripts/abbey-youtube-data-pipeline-bronze-to-silver.py
+```
+
+Job parameters:
+```
+--bronze_database  = abbey-youtube-data-pipeline-bronze-db
+--bronze_table     = raw_statistics
+--silver_bucket    = abbey-youtube-data-pipeline-silver
+--silver_database  = abbey-youtube-data-pipeline-silver-db
+--silver_table     = clean_statistics
+```
+
+**Silver → Gold job:**
+```
+Glue → Jobs → Create job
+Name: abbey-youtube-data-pipeline-silver-to-gold
+Type: Spark
+Glue version: Glue 5.1
+Script path: s3://aws-glue-assets-{account-id}-us-east-1/scripts/abbey-youtube-data-pipeline-silver-to-gold.py
+```
+
+Job parameters:
+```
+--silver_database  = abbey-youtube-data-pipeline-silver-db
+--gold_bucket      = abbey-youtube-data-pipeline-gold
+--gold_database    = abbey-youtube-data-pipeline-gold-db
+```
+
+---
+
+## Step 7 — Create Glue Workflow
+
+```
+Glue → Workflows → Create workflow
+Name: abbey-youtube-transformation-workflow
+Max concurrency: 1
+```
+
+Inside the workflow graph:
+
+1. Add trigger: Schedule, daily at 2am UTC (`0 2 * * ? *`)
+2. Attach node: Crawler → abbey-youtube-data-pipeline-bronze-crawler
+3. Add trigger: Event, crawler SUCCEEDED
+4. Attach node: Job → abbey-youtube-data-pipeline-bronze-to-silver
+
+---
+
+## Step 8 — Create Lambda Functions
+
+Deploy each Lambda function from the `lambda/` folder:
+
+| Function | Runtime      | Timeout | Memory |
+|---|--------------|---|---|
+| abbey-youtube-data-pipeline-api-ingestion | Python 3.14  | 5 min | 512 MB |
+| abbey-youtube-data-pipeline-malware-scanning | Python 3.114 | 3 min | 512 MB |
+| abbey-youtube-data-pipeline-metadata-validator | Python 3.14  | 3 min | 512 MB |
+| abbey-youtube-data-pipeline-router | Python 3.14  | 3 min | 512 MB |
+| abbey-data-quality-checks | Python 3.14  | 5 min | 512 MB |
+
+Environment variables for Router Lambda:
+```
+CLEAN_BUCKET_NAME     = abbey-youtube-data-pipeline-bronze
+QUARANTINE_BUCKET_NAME = abbey-youtube-data-pipeline-quarantine
+```
+
+Environment variables for Data Quality Lambda:
+```
+S3_BUCKET_SILVER      = abbey-youtube-data-pipeline-silver
+SNS_ALERT_TOPIC_ARN   = arn:aws:sns:us-east-1:{account-id}:abbey-youtube-data-pipeline-alerts
+
+```
+
+---
+
+## Step 9 — Create Step Functions State Machines
+
+**Workflow 1 — Ingestion:**
+```
+Step Functions → State machines → Create
+Name: abbey-youtube-ingestion-workflow
+Definition: paste contents of step_functions/ingestion_workflow.json
+```
+
+**Workflow 2 — Data Quality:**
+```
+Step Functions → State machines → Create
+Name: abbey-youtube-data-quality-workflow
+Definition: paste contents of step_functions/data_quality_workflow.json
+```
+
+---
+
+## Step 10 — Create EventBridge Rules
+
+**Rule 1 — Landing Zone triggers Workflow 1:**
+```
+EventBridge → Rules → Create rule
+Name: abbey-youtube-landing-zone-ingestion-rule
+Event pattern: see eventbridge/landing_zone_rule.json
+Target: Step Functions → abbey-youtube-ingestion-workflow
+```
+
+**Rule 2 — Silver S3 triggers Workflow 2:**
+```
+EventBridge → Rules → Create rule
+Name: abbey-silver-s3-to-dq-rule
+Event pattern: see eventbridge/silver_to_dq_rule.json
+Target: Step Functions → abbey-youtube-data-quality-workflow
+```
+
+---
+
+## Step 11 — Create EventBridge Schedule (API ingestion)
+
+```
+EventBridge → Scheduler → Create schedule
+Name: abbey-youtube-api-daily-fetch
+Schedule: Cron 0 1 * * ? *  (1am UTC daily)
+Target: Lambda → abbey-youtube-data-pipeline-api-ingestion
+```
+
+---
+
+## Step 12 — Configure Athena
+
+```
+Athena → Settings → Query result location:
+s3://abbey-youtube-data-pipeline-athena-results/
+✅ Override client-side settings
+```
+
+---
+
+## Step 13 — Verify End to End
+
+Upload a test file to the Landing Zone:
+```bash
+aws s3 cp test-data/CAvideos.csv \
+  s3://abbey-youtube-data-pipeline-landing-zone/youtube/raw_statistics/region=ca/
+```
+
+Then verify each stage:
+```
+1. Step Functions → ingestion workflow → Executions → SUCCEEDED
+2. S3 → bronze bucket → file exists
+3. Glue → run workflow manually to test transformation
+4. Step Functions → data quality workflow → Executions → SUCCEEDED
+5. S3 → gold bucket → parquet files exist
+6. Athena → SELECT * FROM trending_analytics LIMIT 10 → returns rows
+```
