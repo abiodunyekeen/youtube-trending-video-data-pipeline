@@ -1,0 +1,14 @@
+{
+  "source": ["aws.s3"],
+  "detail-type": ["Object Created"],
+  "detail": {
+    "bucket": {
+      "name": ["abbey-youtube-data-pipeline-silver"]
+    },
+    "object": {
+      "key": [{
+        "prefix": "youtube/statistics/"
+      }]
+    }
+  }
+}
