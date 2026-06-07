@@ -22,7 +22,7 @@ ready for Amazon Athena and QuickSight.
 
 ## Architecture
 
-![architecture](https://raw.githubusercontent.com/abbeylink/youtube-trending-video-data-pipeline/main/architecture/architecture-diagram.png)
+![architecture](architecture/architecture-diagram.png)
 
 The pipeline follows the **medallion architecture** (Bronze → Silver → Gold)
 with two independent workflows — Workflow 1 handles per-file ingestion and
