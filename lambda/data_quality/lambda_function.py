@@ -1,109 +1,250 @@
 """
-Lambda: Landing Zone Router
+Lambda: Data Quality Checks
 ────────────────────────────
-Triggered by Step Functions Workflow 1 after malware scanning
-and metadata validation have completed.
+Called by Step Functions after the Silver layer is built.
+Validates data quality before allowing the Gold aggregation to proceed.
 
-Reads the scan and validation results then routes the file to
-its correct destination — Bronze S3 if the file is clean and
-valid, or Quarantine S3 if the file is infected or corrupt and invalid
-file structure.The original file is deleted from the Landing Zone after routing.
-
-
+Checks performed:
+  1. Row count — is there enough data?
+  2. Null percentage — are critical columns populated?
+  3. Schema validation — do expected columns exist?
+  4. Value range checks — are numeric values reasonable?
+  5. Freshness — is the data recent enough?
 
 Environment Variables:
-    CLEAN_BUCKET_NAME      — Bronze S3 bucket for clean valid files
-    QUARANTINE_BUCKET_NAME — Quarantine S3 bucket for rejected files
+    S3_BUCKET_SILVER        — Silver bucket to check
+    SNS_ALERT_TOPIC_ARN     — SNS for alerts
+    S3_OUTPUT               - s3_output="s3://abbey-youtube-data-pipeline-athena-results/query-results/"
 """
-import boto3
+
 import os
+import json
 import logging
+from datetime import datetime, timezone, timedelta
+
+import boto3
+import awswrangler as wr
+import pandas as pd
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-s3 = boto3.client('s3')
+sns_client = boto3.client("sns")
+SNS_TOPIC = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
+S3_BUCKET_SILVER = os.environ.get("S3_BUCKET_SILVER", "")
+S3_OUTPUT = os.environ.get("S3_OUTPUT", "")
+
+# ── Thresholds ───────────────────────────────────────────────────────────────
+MIN_ROW_COUNT = int(os.environ.get("DQ_MIN_ROW_COUNT", "10"))
+MAX_NULL_PCT = float(os.environ.get("DQ_MAX_NULL_PERCENT", "5.0"))
+MAX_VIEWS = 50_000_000_000  # 50B — sanity check for view counts
+FRESHNESS_HOURS = 48  # Data should be no older than this
+
+
+CRITICAL_COLUMNS = {
+    "clean_statistics": ["video_id", "title", "channel_title", "views", "region"],
+    "clean_reference_data": ["region"],
+}
+
+
+def check_row_count(df: pd.DataFrame, table_name: str) -> dict:
+    """Check that table has minimum number of rows."""
+    count = len(df)
+    passed = count >= MIN_ROW_COUNT
+    return {
+        "check": "row_count",
+        "table": table_name,
+        "value": count,
+        "threshold": MIN_ROW_COUNT,
+        "passed": passed,
+        "message": f"Row count: {count} (min: {MIN_ROW_COUNT})",
+    }
+
+
+def check_null_percentage(df: pd.DataFrame, table_name: str) -> list:
+    """Check null percentages for critical columns."""
+    results = []
+    cols = CRITICAL_COLUMNS.get(table_name, [])
+
+    for col in cols:
+        if col not in df.columns:
+            results.append({
+                "check": "null_pct",
+                "table": table_name,
+                "column": col,
+                "passed": False,
+                "message": f"Column '{col}' missing from table",
+            })
+            continue
+
+        null_pct = (df[col].isna().sum() / len(df)) * 100 if len(df) > 0 else 0
+        passed = bool(null_pct <= MAX_NULL_PCT)
+        results.append({
+            "check": "null_pct",
+            "table": table_name,
+            "column": col,
+            "value": round(null_pct, 2),
+            "threshold": MAX_NULL_PCT,
+            "passed": passed,
+            "message": f"{col} null%: {null_pct:.2f}% (max: {MAX_NULL_PCT}%)",
+        })
+
+    return results
+
+
+def check_schema(df: pd.DataFrame, table_name: str) -> dict:
+    """Check that expected columns exist."""
+    expected = set(CRITICAL_COLUMNS.get(table_name, []))
+    actual = set(df.columns)
+    missing = expected - actual
+    passed = len(missing) == 0
+    return {
+        "check": "schema",
+        "table": table_name,
+        "missing_columns": list(missing),
+        "passed": passed,
+        "message": f"Missing columns: {missing}" if missing else "All expected columns present",
+    }
+
+
+def check_value_ranges(df: pd.DataFrame, table_name: str) -> list:
+    """Check that numeric values are within reasonable ranges."""
+    results = []
+
+    if table_name != "clean_statistics":
+        return results
+
+    if "views" in df.columns:
+        negative = (df["views"] < 0).sum()
+        extreme = (df["views"] > MAX_VIEWS).sum()
+        passed = bool(negative == 0 and extreme == 0)
+        results.append({
+            "check": "value_range",
+            "table": table_name,
+            "column": "views",
+            "negative_count": int(negative),
+            "extreme_count": int(extreme),
+            "passed": passed,
+            "message": f"Views: {negative} negative, {extreme} extreme (>{MAX_VIEWS})",
+        })
+
+    return results
+
+
+def check_freshness(df: pd.DataFrame, table_name: str) -> dict:
+    """Check that data includes recent records."""
+    if "_processed_at" not in df.columns and "_ingestion_timestamp" not in df.columns:
+        return {
+            "check": "freshness",
+            "table": table_name,
+            "passed": True,
+            "message": "No timestamp column found — skipping freshness check (backfill data)",
+        }
+
+    ts_col = "_processed_at" if "_processed_at" in df.columns else "_ingestion_timestamp"
+    try:
+        latest = pd.to_datetime(df[ts_col]).max()
+        # ← ADD THIS: handle NaT (all timestamps null)
+        if pd.isna(latest):
+            return {
+                "check": "freshness",
+                "table": table_name,
+                "passed": True,
+                "message": "No valid timestamps found — skipping freshness check",
+            }
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=FRESHNESS_HOURS)
+        # Handle timezone-naive timestamps
+        if latest.tzinfo is None:
+            latest = latest.replace(tzinfo=timezone.utc)
+        passed = latest >= cutoff
+        return {
+            "check": "freshness",
+            "table": table_name,
+            "latest_record": str(latest),
+            "cutoff": str(cutoff),
+            "passed": passed,
+            "message": f"Latest: {latest}, Cutoff: {cutoff}",
+        }
+    except Exception as e:
+        return {
+            "check": "freshness",
+            "table": table_name,
+            "passed": True,
+            "message": f"Could not parse timestamps: {e} — skipping",
+        }
 
 
 def lambda_handler(event, context):
+    """
+    Run data quality checks on Silver layer tables.
 
-    # Source file info from Step Functions
-    source_bucket = event.get('bucket')
-    source_key = event.get('key')
+    Expected event:
+    {
+        "layer": "silver",
+        "database": "abbey-youtube-data-pipeline-silver-db",
+        "tables": ["clean_statistics", "clean_reference_data"]
+    }
+    """
+    database = event.get("database", S3_BUCKET_SILVER)
+    tables = event.get("tables", ["clean_statistics"])
 
-    # Results from previous validation steps
-    scan_result = event.get('scan_result', 'INFECTED')
-    is_valid = event.get('is_valid', False)
+    all_results = []
+    overall_passed = True
 
-    # Destination buckets from Lambda Environment Variables
-    CLEAN_BUCKET = os.environ.get('CLEAN_BUCKET_NAME')
-    QUARANTINE_BUCKET = os.environ.get('QUARANTINE_BUCKET_NAME')
+    for table_name in tables:
+        logger.info(f"Running DQ checks on {database}.{table_name}...")
 
-    # Validate required input
-    if not source_bucket or not source_key:
-        logger.error("Missing bucket or key in input payload")
+        try:
+            # Read a sample of the data (limit for cost/speed)
+            query = f'SELECT * FROM "{table_name}" LIMIT 10000'
+            df = wr.athena.read_sql_query(
+                sql=query,
+                database=database,
+                ctas_approach=False,
+                s3_output=S3_OUTPUT
+            )
+        except Exception as e:
+            logger.error(f"Could not read {table_name}: {e}")
+            all_results.append({
+                "check": "read_table",
+                "table": table_name,
+                "passed": False,
+                "message": str(e),
+            })
+            overall_passed = False
+            continue
 
-        return {
-            'statusCode': 400,
-            'status': 'ERROR',
-            'error': 'Missing bucket or key'
-        }
+        # Run all checks
+        checks = []
+        checks.append(check_row_count(df, table_name))
+        checks.extend(check_null_percentage(df, table_name))
+        checks.append(check_schema(df, table_name))
+        checks.extend(check_value_ranges(df, table_name))
+        checks.append(check_freshness(df, table_name))
 
-    # Validate environment variables
-    if not CLEAN_BUCKET or not QUARANTINE_BUCKET:
-        logger.error("Environment variables missing")
+        for check in checks:
+            logger.info(f"  {check['check']}: {'PASS' if check['passed'] else 'FAIL'} — {check['message']}")
+            if not check["passed"]:
+                overall_passed = False
 
-        return {
-            'statusCode': 500,
-            'status': 'ERROR',
-            'error': 'Missing environment variables'
-        }
+        all_results.extend(checks)
 
-    # Decide routing destination
-    if scan_result == "CLEAN" and is_valid:
+    # Summary
+    passed_count = sum(1 for r in all_results if r["passed"])
+    total_count = len(all_results)
+    logger.info(f"DQ Summary: {passed_count}/{total_count} checks passed. Overall: {'PASS' if overall_passed else 'FAIL'}")
 
-        dest_bucket = CLEAN_BUCKET
-        status = "BRONZE"
-
-    else:
-
-        dest_bucket = QUARANTINE_BUCKET
-        status = "QUARANTINE"
-
-    try:
-
-        copy_source = {
-            'Bucket': source_bucket,
-            'Key': source_key
-        }
-
-        # Copy object
-        s3.copy_object(
-            CopySource=copy_source,
-            Bucket=dest_bucket,
-            Key=source_key
+    if not overall_passed and SNS_TOPIC:
+        failed = [r for r in all_results if not r["passed"]]
+        sns_client.publish(
+            TopicArn=SNS_TOPIC,
+            Subject="[ABBEY Pipeline] Data quality checks FAILED",
+            Message=json.dumps(failed, indent=2, default=str),
         )
 
-        # Delete original object
-        s3.delete_object(
-            Bucket=source_bucket,
-            Key=source_key
-        )
-
-        logger.info(
-            f"File routed successfully → {status}"
-        )
-
-        return {
-            'statusCode': 200,
-            'status': status,
-            'moved_to': dest_bucket,
-            'bucket': dest_bucket,
-            'key': source_key
-        }
-
-    except Exception as e:
-
-        logger.error(f"Routing failed: {str(e)}")
-
-        raise e
+    return {
+        "quality_passed": bool(overall_passed),
+        "checks_passed": int(passed_count),
+        "checks_total": int(total_count),
+        "details": json.loads(json.dumps(all_results, default=str)),
+    }

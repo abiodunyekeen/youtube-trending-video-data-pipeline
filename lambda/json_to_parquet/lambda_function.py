@@ -1,109 +1,173 @@
 """
-Lambda: Landing Zone Router
-────────────────────────────
-Triggered by Step Functions Workflow 1 after malware scanning
-and metadata validation have completed.
+Lambda: JSON Reference Data → Silver Layer (Parquet)
+────────────────────────────────────────────────────
+Triggered by S3 event when new JSON lands in the Bronze bucket
+under the reference_data prefix.
 
-Reads the scan and validation results then routes the file to
-its correct destination — Bronze S3 if the file is clean and
-valid, or Quarantine S3 if the file is infected or corrupt and invalid
-file structure.The original file is deleted from the Landing Zone after routing.
-
-
+Improvements over original:
+  - Data validation before writing
+  - Deduplication of category records
+  - Proper error handling with dead-letter alerting
+  - Idempotent writes (overwrites partition, not append)
+  - Structured logging
 
 Environment Variables:
-    CLEAN_BUCKET_NAME      — Bronze S3 bucket for clean valid files
-    QUARANTINE_BUCKET_NAME — Quarantine S3 bucket for rejected files
+    S3_BUCKET_SILVER            — Target bucket for cleansed data
+    GLUE_DB_SILVER              — Glue catalog database name
+    GLUE_TABLE_REFERENCE        — Glue catalog table name
+    SNS_ALERT_TOPIC_ARN         — SNS topic for alerts (optional)
 """
-import boto3
+
+import json
 import os
 import logging
+from datetime import datetime, timezone
+from urllib.parse import unquote_plus
 
+import boto3
+import awswrangler as wr
+import pandas as pd
+
+# ── Logging ──────────────────────────────────────────────────────────────────
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-s3 = boto3.client('s3')
+# ── Config ───────────────────────────────────────────────────────────────────
+SILVER_BUCKET = os.environ["S3_BUCKET_SILVER"]
+GLUE_DB = os.environ.get("GLUE_DB_SILVER")
+GLUE_TABLE = os.environ.get("GLUE_TABLE_REFERENCE")
+SNS_TOPIC = os.environ.get("SNS_ALERT_TOPIC_ARN", "")
+SILVER_PATH = f"s3://{SILVER_BUCKET}/youtube/reference_data/"
+
+s3_client = boto3.client("s3")
+sns_client = boto3.client("sns")
+
+
+def read_json_from_s3(bucket: str, key: str) -> dict:
+    """
+    Read raw JSON from S3 using boto3 instead of awswrangler.
+    awswrangler.s3.read_json() fails on the Kaggle/YouTube category JSON
+    because it has mixed types (strings + nested arrays), which pandas
+    can't parse directly into a DataFrame.
+    """
+    response = s3_client.get_object(Bucket=bucket, Key=key)
+    content = response["Body"].read().decode("utf-8")
+    return json.loads(content)
+
+
+def validate_category_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validate and clean the category reference data.
+    Returns cleaned DataFrame or raises ValueError.
+    """
+    if df.empty:
+        raise ValueError("Empty DataFrame — no category items found")
+
+    required_cols = {"id", "snippet.title"}
+    actual_cols = set(df.columns)
+    missing = required_cols - actual_cols
+    if missing:
+        # Try alternate column names from different API versions
+        logger.warning(f"Missing expected columns: {missing}. Available: {actual_cols}")
+
+    # Drop duplicate categories (same id)
+    before = len(df)
+    if "id" in df.columns:
+        df = df.drop_duplicates(subset=["id"], keep="last")
+    after = len(df)
+    if before != after:
+        logger.info(f"  Removed {before - after} duplicate categories")
+
+    return df
+
+
+def send_alert(subject: str, message: str):
+    if SNS_TOPIC:
+        sns_client.publish(TopicArn=SNS_TOPIC, Subject=subject[:100], Message=message)
 
 
 def lambda_handler(event, context):
+    """Process S3 event for new JSON reference files."""
 
-    # Source file info from Step Functions
-    source_bucket = event.get('bucket')
-    source_key = event.get('key')
+    # Handle both direct S3 events and EventBridge-wrapped events
+    records = event.get("Records", [])
+    if not records:
+        # Could be invoked directly by Step Functions
+        records = [event] if "s3" in event else []
 
-    # Results from previous validation steps
-    scan_result = event.get('scan_result', 'INFECTED')
-    is_valid = event.get('is_valid', False)
+    processed = []
+    errors = []
 
-    # Destination buckets from Lambda Environment Variables
-    CLEAN_BUCKET = os.environ.get('CLEAN_BUCKET_NAME')
-    QUARANTINE_BUCKET = os.environ.get('QUARANTINE_BUCKET_NAME')
+    for record in records:
+        try:
+            s3_info = record["s3"]
+            bucket = s3_info["bucket"]["name"]
+            key = unquote_plus(s3_info["object"]["key"])
 
-    # Validate required input
-    if not source_bucket or not source_key:
-        logger.error("Missing bucket or key in input payload")
+            logger.info(f"Processing: s3://{bucket}/{key}")
 
-        return {
-            'statusCode': 400,
-            'status': 'ERROR',
-            'error': 'Missing bucket or key'
-        }
+            # ── Read raw JSON ────────────────────────────────────────────
+            # We use boto3 + json.loads instead of wr.s3.read_json() because
+            # the category JSON has mixed types (strings like "kind"/"etag"
+            # alongside a nested "items" array) which causes pandas to fail
+            # with: "Mixing dicts with non-Series may lead to ambiguous ordering"
+            raw_data = read_json_from_s3(bucket, key)
 
-    # Validate environment variables
-    if not CLEAN_BUCKET or not QUARANTINE_BUCKET:
-        logger.error("Environment variables missing")
+            # The YouTube/Kaggle JSON has { "kind": "...", "items": [...] }
+            # We only care about the items array
+            if "items" in raw_data and isinstance(raw_data["items"], list):
+                df = pd.json_normalize(raw_data["items"])
+            else:
+                # Fallback: try to normalize the entire object
+                df = pd.json_normalize(raw_data)
 
-        return {
-            'statusCode': 500,
-            'status': 'ERROR',
-            'error': 'Missing environment variables'
-        }
+            logger.info(f"  Raw shape: {df.shape}")
 
-    # Decide routing destination
-    if scan_result == "CLEAN" and is_valid:
+            # ── Validate ─────────────────────────────────────────────────
+            df = validate_category_data(df)
 
-        dest_bucket = CLEAN_BUCKET
-        status = "BRONZE"
+            # ── Add metadata columns ─────────────────────────────────────
+            df["_ingestion_timestamp"] = datetime.now(timezone.utc).isoformat()
+            df["_source_file"] = key
 
-    else:
+            # Extract region from the S3 key (e.g., region=US)
+            region = "unknown"
+            for part in key.split("/"):
+                if part.startswith("region="):
+                    region = part.split("=")[1]
+                    break
+            df["region"] = region
 
-        dest_bucket = QUARANTINE_BUCKET
-        status = "QUARANTINE"
+            logger.info(f"  Clean shape: {df.shape}, region: {region}")
 
-    try:
+            # ── Write to Silver layer as Parquet ─────────────────────────
+            wr_response = wr.s3.to_parquet(
+                df=df,
+                path=SILVER_PATH,
+                dataset=True,
+                database=GLUE_DB,
+                table=GLUE_TABLE,
+                partition_cols=["region"],
+                mode="overwrite_partitions",  # Idempotent per region
+                schema_evolution=True,
+            )
 
-        copy_source = {
-            'Bucket': source_bucket,
-            'Key': source_key
-        }
+            logger.info(f"  Written to Silver: {SILVER_PATH}")
+            processed.append({"key": key, "region": region, "rows": len(df)})
 
-        # Copy object
-        s3.copy_object(
-            CopySource=copy_source,
-            Bucket=dest_bucket,
-            Key=source_key
+        except Exception as e:
+            logger.error(f"Error processing record: {e}", exc_info=True)
+            errors.append({"key": key if "key" in dir() else "unknown", "error": str(e)})
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    if errors:
+        send_alert(
+            subject="[ABBEY Pipeline] Silver reference transform failed",
+            message=json.dumps(errors, indent=2),
         )
 
-        # Delete original object
-        s3.delete_object(
-            Bucket=source_bucket,
-            Key=source_key
-        )
-
-        logger.info(
-            f"File routed successfully → {status}"
-        )
-
-        return {
-            'statusCode': 200,
-            'status': status,
-            'moved_to': dest_bucket,
-            'bucket': dest_bucket,
-            'key': source_key
-        }
-
-    except Exception as e:
-
-        logger.error(f"Routing failed: {str(e)}")
-
-        raise e
+    return {
+        "statusCode": 200,
+        "processed": processed,
+        "errors": errors,
+    }
