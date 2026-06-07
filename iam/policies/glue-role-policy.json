@@ -1,0 +1,41 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "S3Access",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket",
+                "s3:DeleteObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::abbey-youtube-data-pipeline-bronze",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-bronze/*",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-silver",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-silver/*",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-gold",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-gold/*",
+                "arn:aws:s3:::aws-glue-assets-{account-id}-us-east-1",
+                "arn:aws:s3:::aws-glue-assets-{account-id}-us-east-1/*"
+            ]
+        },
+        {
+            "Sid": "GlueCatalogAccess",
+            "Effect": "Allow",
+            "Action": [
+                "glue:GetDatabase",
+                "glue:CreateDatabase",
+                "glue:GetTable",
+                "glue:CreateTable",
+                "glue:UpdateTable",
+                "glue:GetPartitions",
+                "glue:BatchCreatePartition"
+            ],
+            "Resource": [
+                "*"
+            ]
+        }
+    ]
+}

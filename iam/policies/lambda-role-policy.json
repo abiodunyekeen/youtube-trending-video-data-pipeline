@@ -1,0 +1,61 @@
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "Statement1",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetBucketLocation",
+                "s3:GetObject",
+                "s3:PutObject",
+                "s3:ListBucket",
+                "s3:DeleteObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::abbey-youtube-data-pipeline-landing-zone",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-landing-zone/*",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-quarantine",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-quarantine/*",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-bronze/*",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-bronze/*",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-silver",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-silver/*",
+                "arn:aws:s3:::abbey-youtube-data-pipeline-athena-results",
+                "arn:aws:s3:::aabbey-youtube-data-pipeline-athena-results/*"
+            ]
+        },
+        {
+            "Sid": "GlueAccess",
+            "Effect": "Allow",
+            "Action": [
+                "glue:GetTable",
+                "glue:GetDatabase",
+                "glue:CreateTable",
+                "glue:UpdateTable",
+                "glue:GetPartitions",
+                "glue:CreatePartition",
+                "glue:BatchCreatePartition",
+                "glue:StartWorkflowRun",
+                "glue:GetWorkflow"
+            ],
+            "Resource": "*"
+        },
+        {
+            "Sid": "SNSAccess",
+            "Effect": "Allow",
+            "Action": "sns:Publish",
+            "Resource": "arn:aws:sns:us-east-1:{account-id}:abbey-youtube-data-pipeline-alerts"
+        },
+        {
+            "Sid": "AthenaAccess",
+            "Effect": "Allow",
+            "Action": [
+                "athena:StartQueryExecution",
+                "athena:GetQueryExecution",
+                "athena:GetQueryResults",
+                "athena:GetWorkGroup"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
